@@ -77,6 +77,8 @@ do_install() {
 }
 
 do_uninstall() {
+    # the profiles' keyboard shortcuts would run a binary that is gone
+    [[ -x "$BIN/gnome-monitor" ]] && "$BIN/gnome-monitor" shortcut all --clear >/dev/null 2>&1 || true
     rm -f "$BIN/gnome-monitor" "$BIN/gnome-monitor-panel" \
           "$APPS/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" \
           "$AUTOSTART_DIR/$APP_ID-restore.desktop"

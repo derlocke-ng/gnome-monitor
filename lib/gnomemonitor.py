@@ -823,50 +823,209 @@ def conf_set(key, value):
         fh.writelines(lines)
 
 
+# ── keyboard shortcuts ────────────────────────────────────────────────────────
+# GNOME's own custom shortcuts (Settings → Keyboard), one per profile, each
+# running `gnome-monitor apply <name>` — gnome-settings-daemon handles the key.
+
+MEDIA_KEYS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+CUSTOM_KEY_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
+CUSTOM_KEY_DIR = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+SHORTCUT_PREFIX = "gnome-monitor-"
+
+
+def shortcuts_available():
+    src = Gio.SettingsSchemaSource.get_default()
+    return bool(src and src.lookup(MEDIA_KEYS_SCHEMA, True) and src.lookup(CUSTOM_KEY_SCHEMA, True))
+
+
+def _media_keys():
+    if not shortcuts_available():
+        raise MonitorError("GNOME's custom shortcuts are not available here "
+                           "(no gnome-settings-daemon schemas)")
+    return Gio.Settings.new(MEDIA_KEYS_SCHEMA)
+
+
+def _shortcut_path(name):
+    return f"{CUSTOM_KEY_DIR}{SHORTCUT_PREFIX}{check_name(name)}/"
+
+
+def parse_binding(text):
+    """'super+shift+1' or '<Super><Shift>1' -> '<Super><Shift>1'."""
+    t = text.strip()
+    if "<" in t:
+        return t
+    parts = [p for p in re.split(r"[+\s]+", t) if p]
+    if not parts:
+        raise MonitorError("a shortcut looks like super+1, ctrl+alt+F2 or <Super><Shift>1")
+    names = {"super": "Super", "win": "Super", "ctrl": "Control", "control": "Control",
+             "alt": "Alt", "shift": "Shift", "meta": "Meta", "hyper": "Hyper"}
+    bad = [p for p in parts[:-1] if p.lower() not in names]
+    if bad:
+        raise MonitorError(f"unknown modifier '{bad[0]}' — use super, ctrl, alt, shift")
+    if len(parts) == 1 and not re.match(r"^F\d+$", parts[0], re.I):
+        raise MonitorError("a plain key would get in the way of typing — add super, ctrl or alt")
+    return "".join(f"<{names[p.lower()]}>" for p in parts[:-1]) + parts[-1]
+
+
+def shortcut_get(name):
+    """The accelerator bound to a profile ('<Super>1'), or None."""
+    if not shortcuts_available():
+        return None
+    base = Gio.Settings.new(MEDIA_KEYS_SCHEMA)
+    path = _shortcut_path(name)
+    if path not in base.get_strv("custom-keybindings"):
+        return None
+    return Gio.Settings.new_with_path(CUSTOM_KEY_SCHEMA, path).get_string("binding") or None
+
+
+def shortcut_set(name, binding):
+    base = _media_keys()
+    path = _shortcut_path(name)
+    kb = Gio.Settings.new_with_path(CUSTOM_KEY_SCHEMA, path)
+    kb.set_string("name", f"Gnome Monitor: {name}")
+    kb.set_string("command", f"{cli_path()} apply {name}")
+    kb.set_string("binding", binding)
+    paths = base.get_strv("custom-keybindings")
+    if path not in paths:
+        base.set_strv("custom-keybindings", paths + [path])
+    Gio.Settings.sync()
+
+
+def shortcut_clear(name):
+    if not shortcuts_available():
+        return
+    base = Gio.Settings.new(MEDIA_KEYS_SCHEMA)
+    path = _shortcut_path(name)
+    paths = base.get_strv("custom-keybindings")
+    if path in paths:
+        base.set_strv("custom-keybindings", [p for p in paths if p != path])
+    kb = Gio.Settings.new_with_path(CUSTOM_KEY_SCHEMA, path)
+    for key in ("name", "command", "binding"):
+        kb.reset(key)
+    Gio.Settings.sync()
+
+
+def shortcuts_all():
+    """{profile: binding} for every shortcut of ours."""
+    if not shortcuts_available():
+        return {}
+    out = {}
+    head = CUSTOM_KEY_DIR + SHORTCUT_PREFIX
+    for path in Gio.Settings.new(MEDIA_KEYS_SCHEMA).get_strv("custom-keybindings"):
+        if path.startswith(head):
+            name = path[len(head):].rstrip("/")
+            out[name] = Gio.Settings.new_with_path(CUSTOM_KEY_SCHEMA, path).get_string("binding")
+    return out
+
+
 # ── arranging ─────────────────────────────────────────────────────────────────
+# A port of GNOME Settings' find_best_snapping() (panels/display/
+# cc-display-arrangement.c), with its "infinite" major snap distance: the
+# dragged screen always attaches to the nearest edge of another screen and
+# slides along it; corners and centres click into line when within
+# MINOR_SNAP_DISTANCE widget pixels; it never detaches (MIN_OVERLAP).
 
-def snap(layout, lg, x, y, tol=0):
-    """Where a dragged screen lands when let go at (x, y): there, if it
-    touches another screen and covers none — else docked to the nearest side
-    of the nearest screen. Edges and centres within tol snap into line."""
+SNAP_X, SNAP_Y, SNAP_BOTH = 1, 2, 3
+MINOR_SNAP_DISTANCE = 6     # widget px (GNOME: 5)
+MIN_OVERLAP = 25            # logical px
+
+
+def snap(layout, lg, x, y, scale):
+    """Where the dragged screen `lg` lands for the pointer position (x, y)
+    in layout coordinates; `scale` is layout px -> widget px."""
     lm = layout.layout_mode
-    others = [o.rect(lm) for o in layout.logicals if o is not lg]
-    if not others:
-        return x, y
     w, h = lg.size(lm)
+    x1, y1, x2, y2 = x, y, x + w, y + h
+    sd = {"snapped": 0, "x": x, "y": y, "dx": 0.0, "dy": 0.0}
 
-    def fits(r):
-        return (not any(r.overlaps(o) for o in others)
-                and any(r.adjacent(o) for o in others))
+    def dist(nx, ny):
+        return abs(x - nx) * scale, abs(y - ny) * scale
 
-    cands = []
-    for o in others:
-        # along a side, keep the dragged position but stay in touch
-        cy = min(max(y, o.y - h + 1), o.bottom - 1)
-        cx = min(max(x, o.x - w + 1), o.right - 1)
-        for px, py, side in ((o.right, cy, "x"), (o.x - w, cy, "x"),
-                             (cx, o.bottom, "y"), (cx, o.y - h, "y")):
-            if tol and side == "x":
-                for ay in (o.y, o.bottom - h, o.cy - h // 2):
-                    if abs(py - ay) <= tol:
-                        py = ay
-                        break
-            elif tol:
-                for ax in (o.x, o.right - w, o.x + o.w // 2 - w // 2):
-                    if abs(px - ax) <= tol:
-                        px = ax
-                        break
-            cands.append((px, py))
+    def maybe(nx, ny, snapped, major, minor_unlimited=0):
+        dx, dy = dist(nx, ny)
+        d = max(dx, dy)
+        # the minor axis must be (nearly) in place — unless the candidate
+        # only pulls the screen back from hanging over an edge
+        if major == SNAP_X and dy > MINOR_SNAP_DISTANCE:
+            if ny > y and minor_unlimited <= 0:
+                return
+            if ny < y and minor_unlimited >= 0:
+                return
+        if major == SNAP_Y and dx > MINOR_SNAP_DISTANCE:
+            if nx > x and minor_unlimited <= 0:
+                return
+            if nx < x and minor_unlimited >= 0:
+                return
+        update = 0
+        if snapped == SNAP_BOTH:
+            if sd["snapped"] == 0:
+                update = SNAP_BOTH
+            if (major == SNAP_X and dx < sd["dx"]) or (major == SNAP_Y and dy < sd["dy"]):
+                update = SNAP_BOTH
+            if (sd["snapped"] == SNAP_X and d <= sd["dx"]) or (sd["snapped"] == SNAP_Y and d <= sd["dy"]):
+                update = SNAP_BOTH
+            if ((sd["snapped"] == SNAP_X and major == SNAP_X and nx == sd["x"])
+                    or (sd["snapped"] == SNAP_Y and major == SNAP_Y and ny == sd["y"])):
+                update = SNAP_BOTH
+        elif snapped == SNAP_X:
+            if dx < sd["dx"] or not (sd["snapped"] & SNAP_X):
+                update = SNAP_X
+        else:
+            if dy < sd["dy"] or not (sd["snapped"] & SNAP_Y):
+                update = SNAP_Y
+        if update & SNAP_X:
+            sd["dx"], sd["x"] = dx, nx
+            sd["snapped"] |= SNAP_X
+        if update & SNAP_Y:
+            sd["dy"], sd["y"] = dy, ny
+            sd["snapped"] |= SNAP_Y
 
-    def dist(c):
-        return (c[0] - x) ** 2 + (c[1] - y) ** 2
+    for o in layout.logicals:
+        if o is lg:
+            continue
+        r = o.rect(lm)
+        _x1, _y1, _x2, _y2, _w, _h = r.x, r.y, r.right, r.bottom, r.w, r.h
+        top, bottom, left, right = _y1 - h, _y2, _x1 - w, _x2
 
-    if fits(Rect(x, y, w, h)):
-        near = [c for c in cands if abs(c[0] - x) <= tol and abs(c[1] - y) <= tol
-                and fits(Rect(c[0], c[1], w, h))]
-        return min(near, key=dist) if near else (x, y)
-    good = [c for c in cands if fits(Rect(c[0], c[1], w, h))]
-    return min(good, key=dist) if good else (x, y)
+        dy = 9999.0
+        if x1 <= _x2 and _x1 <= x2:                 # overlap on the X axis
+            dy = min(dist(x1, top)[1], dist(x1, bottom)[1])
+        dx = 9999.0
+        if y1 <= _y2 and _y1 <= y2:                 # overlap on the Y axis
+            dx = min(dist(left, y1)[0], dist(right, y1)[0])
+        # slide along the nearer edge of this screen
+        if dy < dx:
+            maybe(x1, top, SNAP_Y, SNAP_Y)
+            maybe(x1, bottom, SNAP_Y, SNAP_Y)
+        elif dx < 9999:
+            maybe(left, y1, SNAP_X, SNAP_X)
+            maybe(right, y1, SNAP_X, SNAP_X)
+        # corners and centres in line, above and below
+        for nx in (_x1, _x2 - w, _x1 + _w // 2 - w // 2):
+            maybe(nx, top, SNAP_BOTH, SNAP_Y)
+            maybe(nx, bottom, SNAP_BOTH, SNAP_Y)
+        # corners in line, left and right
+        for ny in (_y1, _y2 - h):
+            maybe(left, ny, SNAP_BOTH, SNAP_X)
+            maybe(right, ny, SNAP_BOTH, SNAP_X)
+        # hanging over an edge: keep a minimal overlap, never detach
+        maybe(_x1 - w + MIN_OVERLAP, top, SNAP_BOTH, SNAP_Y, 1)
+        maybe(_x2 - MIN_OVERLAP, top, SNAP_BOTH, SNAP_Y, -1)
+        maybe(_x1 - w + MIN_OVERLAP, bottom, SNAP_BOTH, SNAP_Y, 1)
+        maybe(_x2 - MIN_OVERLAP, bottom, SNAP_BOTH, SNAP_Y, -1)
+        maybe(left, _y1 - h + MIN_OVERLAP, SNAP_BOTH, SNAP_X, 1)
+        maybe(left, _y2 - MIN_OVERLAP, SNAP_BOTH, SNAP_X, -1)
+        maybe(right, _y1 - h + MIN_OVERLAP, SNAP_BOTH, SNAP_X, 1)
+        maybe(right, _y2 - MIN_OVERLAP, SNAP_BOTH, SNAP_X, -1)
+    return sd["x"], sd["y"]
+
+
+def overlaps_any(layout, lg, x, y):
+    """Would `lg` at (x, y) cover another screen?"""
+    lm = layout.layout_mode
+    w, h = lg.size(lm)
+    r = Rect(x, y, w, h)
+    return any(r.overlaps(o.rect(lm)) for o in layout.logicals if o is not lg)
 
 
 # ── text output ───────────────────────────────────────────────────────────────

@@ -12,6 +12,8 @@
   gnome-monitor mode <monitor> <WxH[@Hz][+vrr]>   resolution / refresh rate
   gnome-monitor modes <monitor>      what a screen offers
   gnome-monitor delete <name>
+  gnome-monitor shortcut <name> super+1  a GNOME keyboard shortcut that applies the profile
+  gnome-monitor shortcut <name> --clear  (--clear all removes every one of ours)
   gnome-monitor restore              re-apply the last layout (runs at login)
   gnome-monitor settings [ask-to-keep on|off] [restore-at-login on|off]
 
@@ -97,13 +99,15 @@ def cmd_list(args):
         say("no profiles yet — save the current layout with: gnome-monitor save <name>")
         return
     active = set(gm.active_profiles(lay))
+    keys = gm.shortcuts_all()
     for name in names:
         try:
             other, notes = gm.layout_from_profile(gm.load_profile(name), lay.state)
             text = other.summary() or "(no connected screen is in it)"
         except gm.MonitorError as e:
             text = f"broken: {e}"
-        say(f"{'*' if name in active else ' '} {name:<20} {text}")
+        key = f"  [{keys[name]}]" if name in keys else ""
+        say(f"{'*' if name in active else ' '} {name:<20} {text}{key}")
 
 
 def cmd_apply(args):
@@ -175,7 +179,38 @@ def cmd_modes(args):
 
 def cmd_delete(args):
     gm.delete_profile(args.name)
+    gm.shortcut_clear(args.name)
     say(f"deleted profile '{args.name}'")
+
+
+def cmd_shortcut(args):
+    if args.clear:
+        if args.name == "all":
+            for name in gm.shortcuts_all():
+                gm.shortcut_clear(name)
+                say(f"removed the shortcut of '{name}'")
+            return
+        if not args.name:
+            raise gm.MonitorError("which profile? gnome-monitor shortcut <name> --clear")
+        gm.shortcut_clear(args.name)
+        say(f"removed the shortcut of '{args.name}'")
+        return
+    if not args.name:
+        keys = gm.shortcuts_all()
+        if not keys:
+            say("no shortcuts yet — e.g.: gnome-monitor shortcut <profile> super+1")
+        for name, key in keys.items():
+            say(f"{name:<20} {key}")
+        return
+    if not args.binding:
+        key = gm.shortcut_get(args.name)
+        say(f"{args.name}: {key}" if key else f"{args.name}: no shortcut")
+        return
+    if args.name not in gm.list_profiles():
+        raise gm.MonitorError(f"no profile '{args.name}' — see: gnome-monitor list")
+    binding = gm.parse_binding(args.binding)
+    gm.shortcut_set(args.name, binding)
+    say(f"{binding} applies '{args.name}' — it is a custom shortcut in GNOME Settings → Keyboard")
 
 
 def cmd_restore(args):
@@ -269,6 +304,11 @@ def main(argv):
     sp = sub.add_parser("delete", help="delete a profile")
     sp.add_argument("name")
     sp.set_defaults(fn=cmd_delete)
+    sp = sub.add_parser("shortcut", help="a keyboard shortcut that applies a profile")
+    sp.add_argument("name", nargs="?", help="profile, or 'all' with --clear")
+    sp.add_argument("binding", nargs="?", help="super+1, ctrl+alt+F2, <Super><Shift>1 …")
+    sp.add_argument("--clear", action="store_true", help="remove the shortcut")
+    sp.set_defaults(fn=cmd_shortcut)
     sp = sub.add_parser("restore", help="re-apply the last layout (at login)")
     sp.add_argument("--delay", type=float, default=0, metavar="SECONDS",
                     help="wait first — the session is still settling at login")

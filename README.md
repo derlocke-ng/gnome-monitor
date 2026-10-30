@@ -50,6 +50,7 @@ gnome-monitor only odyssey hp      # exactly these on, every other off
 gnome-monitor main odyssey         # the main screen
 gnome-monitor mode rog 2560x1440@165
 gnome-monitor modes rog            # what it offers
+gnome-monitor shortcut desk super+1  # a GNOME keyboard shortcut that applies "desk"
 gnome-monitor settings             # ask-to-keep / restore-at-login
 gnome-monitor-panel                # the GTK panel ("Gnome Monitor" in the app grid)
 ```
@@ -57,9 +58,15 @@ gnome-monitor-panel                # the GTK panel ("Gnome Monitor" in the app g
 `--dry-run` on any change asks Mutter whether the layout is valid and
 changes nothing.
 
-In the panel: click a profile to apply it, the switch turns a screen off and
-on, *Main* picks the main screen, the gear opens resolution / refresh rate /
-scale, *Edit* above the picture arranges the screens by dragging.
+In the panel: click a profile to apply it, the keyboard icon next to it sets
+a shortcut (press the keys, like in GNOME Settings), the switch turns a screen
+off and on, *Main* picks the main screen, the gear opens resolution / refresh
+rate / scale, *Edit* above the picture arranges the screens by dragging — with
+GNOME Settings' snapping.
+
+A shortcut is one of GNOME's own custom shortcuts (Settings → Keyboard →
+Custom Shortcuts), running `gnome-monitor apply <name>`; it works on Wayland
+and X11 and goes away with the profile, or with the app.
 
 ## Install
 

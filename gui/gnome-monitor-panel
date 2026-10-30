@@ -28,19 +28,12 @@ APP_ID = "eu.kiwinetwork.GnomeMonitor"
 MAP_HEIGHT = 170
 
 
-def iter_children(widget):
-    child = widget.get_first_child()
-    while child is not None:
-        yield child
-        child = child.get_next_sibling()
-
-
 # ── main window ──────────────────────────────────────────────────────────────
 
 class MonitorWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Gnome Monitor")
-        self.set_default_size(560, 620)
+        self.set_default_size(600, -1)      # as tall as the content
         self._busy = False
         self._updating = False      # filling widgets, not the user
         self._lay = None
@@ -121,7 +114,7 @@ class MonitorWindow(Adw.ApplicationWindow):
 
         self._toasts = Adw.ToastOverlay()
         root.set_content(self._toasts)
-        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll = Gtk.ScrolledWindow(vexpand=True, propagate_natural_height=True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self._toasts.set_child(scroll)
         page = Adw.PreferencesPage()
@@ -152,34 +145,24 @@ class MonitorWindow(Adw.ApplicationWindow):
         card.add_css_class("card")
         map_grp.add(card)
 
-        # ── profiles ─────────────────────────────────────────────────────
-        self._prof_grp = Adw.PreferencesGroup(title="Profiles")
-        box = Gtk.Box(spacing=6)
-        self._name_entry = Gtk.Entry(placeholder_text="name", width_chars=12,
-                                     valign=Gtk.Align.CENTER)
-        self._name_entry.connect("activate", lambda *_: self._save_profile())
-        save_btn = Gtk.Button(label="Save Current", valign=Gtk.Align.CENTER)
-        save_btn.add_css_class("suggested-action")
-        save_btn.connect("clicked", lambda *_: self._save_profile())
-        box.append(self._name_entry)
-        box.append(save_btn)
-        self._prof_grp.set_header_suffix(box)
-        page.add(self._prof_grp)
-        # chips in a grid: a click applies, the active one is highlighted
-        self._prof_flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
-                                      min_children_per_line=1, max_children_per_line=4,
-                                      row_spacing=6, column_spacing=6, homogeneous=False,
-                                      halign=Gtk.Align.START)
-        self._prof_grp.add(self._prof_flow)
-        self._prof_empty = Gtk.Label(
-            label="No profiles yet — save the current layout under a name; click it to switch back any time.",
-            xalign=0, wrap=True, margin_top=6)
-        self._prof_empty.add_css_class("dim-label")
-        self._prof_grp.add(self._prof_empty)
-
         # ── monitors ─────────────────────────────────────────────────────
         self._mon_grp = Adw.PreferencesGroup(title="Monitors")
         page.add(self._mon_grp)
+
+        # ── profiles: one row each, a click applies; the last row saves ──
+        self._prof_grp = Adw.PreferencesGroup(title="Profiles")
+        page.add(self._prof_grp)
+        self._profile_rows = []
+        self._save_row = Adw.ActionRow(title="Save the current layout as")
+        self._name_entry = Gtk.Entry(placeholder_text="name", width_chars=14,
+                                     valign=Gtk.Align.CENTER)
+        self._name_entry.connect("activate", lambda *_: self._save_profile())
+        save_btn = Gtk.Button(label="Save", valign=Gtk.Align.CENTER)
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", lambda *_: self._save_profile())
+        self._save_row.add_suffix(self._name_entry)
+        self._save_row.add_suffix(save_btn)
+        self._prof_grp.add(self._save_row)
 
         # ── status bar ───────────────────────────────────────────────────
         self._status_lbl = Gtk.Label(label="", xalign=0, margin_start=16, margin_end=16,
@@ -257,7 +240,7 @@ class MonitorWindow(Adw.ApplicationWindow):
             self._update_monitor_row(m)
 
     def _make_monitor_row(self, m, group_check):
-        row = Adw.ActionRow(title=m.name, icon_name="video-display-symbolic")
+        row = Adw.ActionRow(title=m.name, icon_name="video-display-symbolic", subtitle_lines=1)
         main = Gtk.CheckButton(label="Main", valign=Gtk.Align.CENTER, tooltip_text="Main screen")
         if group_check:
             main.set_group(group_check)
@@ -292,35 +275,49 @@ class MonitorWindow(Adw.ApplicationWindow):
             rd["row"].set_subtitle(f"{m.connector} · off")
 
     def _populate_profiles(self):
-        flow = self._prof_flow
-        while (child := flow.get_first_child()) is not None:
-            flow.remove(child)
+        for r in self._profile_rows:
+            self._prof_grp.remove(r)
+        self._profile_rows = []
+        self._prof_grp.remove(self._save_row)     # it goes back in last
         names = gm.list_profiles()
         active = set(gm.active_profiles(self._lay))
-        self._prof_empty.set_visible(not names)
         for name in names:
             try:
                 other, _ = gm.layout_from_profile(gm.load_profile(name), self._lay.state)
-                tip = (other.summary() or "none of its screens is connected") + "\n(click to apply)"
+                text = other.compact() or "none of its screens is connected"
+                tip = other.summary() + "\n(click to apply)"
             except gm.MonitorError as e:
-                tip = f"broken: {e}"
-            chip = Gtk.Box()
-            chip.add_css_class("linked")
-            btn = Gtk.Button(tooltip_text=tip)
-            inner = Gtk.Box(spacing=6)
-            if name in active:
-                inner.append(Gtk.Image(icon_name="object-select-symbolic"))
-                btn.add_css_class("suggested-action")
-            inner.append(Gtk.Label(label=name, ellipsize=Pango.EllipsizeMode.END, max_width_chars=22))
-            btn.set_child(inner)
-            btn.connect("clicked", lambda _b, n=name: self._apply_profile(n))
-            chip.append(btn)
-            del_btn = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete profile")
+                text, tip = f"broken: {e}", None
+            row = Adw.ActionRow(title=name, subtitle=text, subtitle_lines=1, activatable=True,
+                                tooltip_text=tip)
+            row.connect("activated", lambda _r, n=name: self._apply_profile(n))
+            mark = Gtk.Image(icon_name="object-select-symbolic")
+            mark.add_css_class("accent")
+            if name not in active:
+                mark.set_opacity(0)
+            row.add_prefix(mark)
+            if gm.shortcuts_available():
+                key = gm.shortcut_get(name)
+                if key:
+                    ok, kv, mods = Gtk.accelerator_parse(key)
+                    key_btn = Gtk.Button(label=Gtk.accelerator_get_label(kv, mods) if ok else key,
+                                         valign=Gtk.Align.CENTER, tooltip_text="Change the shortcut")
+                else:
+                    key_btn = Gtk.Button(icon_name="input-keyboard-symbolic", valign=Gtk.Align.CENTER,
+                                         tooltip_text="Set a keyboard shortcut")
+                key_btn.add_css_class("flat")
+                key_btn.connect("clicked", lambda _b, n=name: self._edit_shortcut(n))
+                row.add_suffix(key_btn)
+            del_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                 tooltip_text="Delete profile")
+            del_btn.add_css_class("flat")
             del_btn.connect("clicked", lambda _b, n=name: self._delete_profile(n))
-            chip.append(del_btn)
-            flow.append(chip)
-        for fc in iter_children(flow):
-            fc.set_focusable(False)   # the buttons take the focus, not the cell
+            row.add_suffix(del_btn)
+            self._prof_grp.add(row)
+            self._profile_rows.append(row)
+        self._prof_grp.add(self._save_row)
+        self._save_row.set_subtitle("Click a profile to apply it" if names
+                                    else "No profiles yet — the first one is one click away")
 
     # ── the picture ────────────────────────────────────────────────────────
     def _draw_map(self, area, cr, width, height):
@@ -409,6 +406,7 @@ class MonitorWindow(Adw.ApplicationWindow):
         self._cancel_btn.set_visible(True)
         self._apply_btn.set_visible(True)
         self._map.set_content_height(MAP_HEIGHT + 90)
+        self._map.set_cursor_from_name("grab")
         self._prof_grp.set_sensitive(False)
         self._mon_grp.set_sensitive(False)
         self._set_status("Drag a screen to where it should be, then Apply.")
@@ -423,6 +421,7 @@ class MonitorWindow(Adw.ApplicationWindow):
         self._cancel_btn.set_visible(False)
         self._apply_btn.set_visible(False)
         self._map.set_content_height(MAP_HEIGHT)
+        self._map.set_cursor(None)
         self._prof_grp.set_sensitive(True)
         self._mon_grp.set_sensitive(True)
         self._map.queue_draw()
@@ -448,17 +447,18 @@ class MonitorWindow(Adw.ApplicationWindow):
         for l in reversed(self._edit_lay.ordered_logicals()):
             r = l.rect(lm)
             if r.x <= lx < r.right and r.y <= ly < r.bottom:
-                self._drag = (l, l.x, l.y)
+                # the picture's scale is frozen for the whole drag
+                self._drag = (l, l.x, l.y, s)
                 break
         self._map.queue_draw()
 
     def _drag_update(self, _g, dx, dy):
-        if not self._drag or not self._xform:
+        if not self._drag:
             return
-        l, x0, y0 = self._drag
-        s = self._xform[0]
-        x, y = round(x0 + dx / s), round(y0 + dy / s)
-        l.x, l.y = gm.snap(self._edit_lay, l, x, y, tol=int(14 / s))
+        l, x0, y0, s = self._drag
+        x, y = gm.snap(self._edit_lay, l, round(x0 + dx / s), round(y0 + dy / s), s)
+        if not gm.overlaps_any(self._edit_lay, l, x, y):   # a screen is solid
+            l.x, l.y = x, y
         self._map.queue_draw()
 
     def _drag_end(self, g, dx, dy):
@@ -668,6 +668,63 @@ class MonitorWindow(Adw.ApplicationWindow):
         self._toast(f"Saved '{name}'.")
         self._refresh()
 
+    # ── shortcuts: GNOME custom keybindings, captured like Settings does ───
+    MODIFIER_KEYS = {Gdk.KEY_Shift_L, Gdk.KEY_Shift_R, Gdk.KEY_Control_L, Gdk.KEY_Control_R,
+                     Gdk.KEY_Alt_L, Gdk.KEY_Alt_R, Gdk.KEY_Super_L, Gdk.KEY_Super_R,
+                     Gdk.KEY_Meta_L, Gdk.KEY_Meta_R, Gdk.KEY_Hyper_L, Gdk.KEY_Hyper_R,
+                     Gdk.KEY_ISO_Level3_Shift, Gdk.KEY_Caps_Lock, Gdk.KEY_Num_Lock}
+
+    def _edit_shortcut(self, name):
+        current = gm.shortcut_get(name)
+        body = "Press the keys to use — with Super, Ctrl or Alt, or a function key. Esc cancels."
+        if current:
+            ok, kv, mods = Gtk.accelerator_parse(current)
+            body += f"\n\nNow: {Gtk.accelerator_get_label(kv, mods) if ok else current}"
+        dlg = Adw.AlertDialog(heading=f"Shortcut for '{name}'", body=body)
+        dlg.add_response("cancel", "Cancel")
+        if current:
+            dlg.add_response("clear", "Remove Shortcut")
+            dlg.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "clear" and self._clear_shortcut(name))
+
+        def on_key(_ctrl, keyval, keycode, state):
+            mods = state & Gtk.accelerator_get_default_mod_mask()
+            if keyval == Gdk.KEY_Escape and not mods:
+                dlg.close()
+                return True
+            if keyval in self.MODIFIER_KEYS:
+                return False
+            # the key's unshifted meaning, so Shift+1 is '<Shift>1', not 'exclam'
+            ok, keys, keyvals = Gdk.Display.get_default().map_keycode(keycode)
+            if ok and keys:
+                keyval = min(zip(keys, keyvals), key=lambda kv: (kv[0].group, kv[0].level))[1]
+            keyval = Gdk.keyval_to_lower(keyval)
+            if not mods and not (Gdk.KEY_F1 <= keyval <= Gdk.KEY_F35):
+                dlg.set_body(body + "\n\nA plain key would get in the way of typing — add Super, Ctrl or Alt.")
+                return True
+            accel = Gtk.accelerator_name(keyval, mods)
+            try:
+                gm.shortcut_set(name, accel)
+            except gm.MonitorError as e:
+                self._toast(str(e))
+            else:
+                self._toast(f"{Gtk.accelerator_get_label(keyval, mods)} applies '{name}'.")
+            dlg.close()
+            self._refresh()
+            return True
+
+        ctrl = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        ctrl.connect("key-pressed", on_key)
+        dlg.add_controller(ctrl)
+        dlg.present(self)
+
+    def _clear_shortcut(self, name):
+        gm.shortcut_clear(name)
+        self._toast(f"Removed the shortcut of '{name}'.")
+        self._refresh()
+
     def _delete_profile(self, name):
         dlg = Adw.AlertDialog(heading=f"Delete '{name}'?",
                               body="The profile file is removed. Your screens are not changed.")
@@ -687,6 +744,7 @@ class MonitorWindow(Adw.ApplicationWindow):
         except gm.MonitorError as e:
             self._toast(str(e))
         else:
+            gm.shortcut_clear(name)
             self._toast(f"Deleted '{name}'.")
         self._refresh()
 
