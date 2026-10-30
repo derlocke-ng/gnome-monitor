@@ -25,7 +25,10 @@ for _d in (os.path.join(_here, "..", "share", "gnome-monitor"), os.path.join(_he
 import gnomemonitor as gm  # noqa: E402
 
 APP_ID = "eu.kiwinetwork.GnomeMonitor"
-MAP_HEIGHT = 170
+# the picture's height follows its width: the wider the window, the bigger
+# the screens are drawn — and the finer the snapping while arranging
+MAP_ASPECT, MAP_MIN, MAP_MAX = 0.30, 170, 340
+EDIT_ASPECT, EDIT_MIN, EDIT_MAX = 0.50, 280, 620
 
 
 # ── main window ──────────────────────────────────────────────────────────────
@@ -33,7 +36,7 @@ MAP_HEIGHT = 170
 class MonitorWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Gnome Monitor")
-        self.set_default_size(600, -1)      # as tall as the content
+        self.set_default_size(820, -1)      # wide picture, as tall as the content
         self._busy = False
         self._updating = False      # filling widgets, not the user
         self._lay = None
@@ -134,8 +137,9 @@ class MonitorWindow(Adw.ApplicationWindow):
             btns.append(b)
         map_grp.set_header_suffix(btns)
         page.add(map_grp)
-        self._map = Gtk.DrawingArea(content_height=MAP_HEIGHT, hexpand=True)
+        self._map = Gtk.DrawingArea(content_height=MAP_MIN, hexpand=True)
         self._map.set_draw_func(self._draw_map)
+        self._map.connect("resize", self._on_map_resize)
         drag = Gtk.GestureDrag()
         drag.connect("drag-begin", self._drag_begin)
         drag.connect("drag-update", self._drag_update)
@@ -172,6 +176,14 @@ class MonitorWindow(Adw.ApplicationWindow):
         root.add_bottom_bar(self._status_lbl)
 
     # ── helpers ────────────────────────────────────────────────────────────
+    def _on_map_resize(self, area, width, _height):
+        if self._editing:
+            want = max(EDIT_MIN, min(int(width * EDIT_ASPECT), EDIT_MAX))
+        else:
+            want = max(MAP_MIN, min(int(width * MAP_ASPECT), MAP_MAX))
+        if want != area.get_content_height():
+            area.set_content_height(want)
+
     def _set_status(self, text):
         self._status_lbl.set_label(text)
         self._status_lbl.set_tooltip_text(text)
@@ -400,12 +412,12 @@ class MonitorWindow(Adw.ApplicationWindow):
         max_x = max(r.right for r in rects)
         max_y = max(r.bottom for r in rects)
         # room around the layout, so a screen can be dragged to any side
-        mx, my = max_x * 0.15, max_y * 0.6
+        mx, my = max_x * 0.12, max_y * 0.55
         self._world = (-mx, -my, max_x + mx, max_y + my)
         self._edit_btn.set_visible(False)
         self._cancel_btn.set_visible(True)
         self._apply_btn.set_visible(True)
-        self._map.set_content_height(MAP_HEIGHT + 90)
+        self._on_map_resize(self._map, self._map.get_width(), 0)
         self._map.set_cursor_from_name("grab")
         self._prof_grp.set_sensitive(False)
         self._mon_grp.set_sensitive(False)
@@ -420,7 +432,7 @@ class MonitorWindow(Adw.ApplicationWindow):
         self._edit_btn.set_visible(True)
         self._cancel_btn.set_visible(False)
         self._apply_btn.set_visible(False)
-        self._map.set_content_height(MAP_HEIGHT)
+        self._on_map_resize(self._map, self._map.get_width(), 0)
         self._map.set_cursor(None)
         self._prof_grp.set_sensitive(True)
         self._mon_grp.set_sensitive(True)
