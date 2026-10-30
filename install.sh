@@ -5,6 +5,7 @@
 #
 #   <prefix>/bin/gnome-monitor, gnome-monitor-panel
 #   <prefix>/share/gnome-monitor/gnomemonitor.py   the core, shared by both
+#   ~/.config/autostart/<app-id>-restore.desktop   re-applies the last layout at login
 #   ~/.config/gnome-monitor/                        profiles + last-seen — kept unless --purge
 set -euo pipefail
 
@@ -22,6 +23,7 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 APPS="$DATA_HOME/applications"
 ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gnome-monitor"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 
 say() { printf ':: %s\n' "$*"; }
 
@@ -59,13 +61,25 @@ do_install() {
         say "no GTK4 stack (or KIWI_GUI=0) — skipping panel"
     fi
 
+    # GNOME does not remember a quietly applied layout; this puts the last one
+    # back at login. Turned off in the app's settings, it stays off.
+    if grep -qs '^RESTORE_AT_LOGIN=0' "$CONF_DIR/gnome-monitor.conf"; then
+        say "restore at login is off in the settings — not installing the autostart entry"
+    else
+        say "installing the login restore (autostart entry)"
+        mkdir -p "$AUTOSTART_DIR"
+        sed "s|^Exec=.*|Exec=$BIN/gnome-monitor restore --delay 3|" "$SRC/data/gnome-monitor-restore.desktop" \
+            > "$AUTOSTART_DIR/$APP_ID-restore.desktop"
+    fi
+
     mkdir -p "$CONF_DIR/profiles"
     say "done — try: gnome-monitor show  |  gnome-monitor save <name>  |  gnome-monitor-panel"
 }
 
 do_uninstall() {
     rm -f "$BIN/gnome-monitor" "$BIN/gnome-monitor-panel" \
-          "$APPS/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg"
+          "$APPS/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" \
+          "$AUTOSTART_DIR/$APP_ID-restore.desktop"
     rm -rf "$LIB"
     refresh_desktop
 

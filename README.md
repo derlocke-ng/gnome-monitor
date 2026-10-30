@@ -25,10 +25,16 @@ was one. Or save each arrangement once and apply it with one click.
   gaps. Switch the middle screen off and the outer two close ranks; switch it
   on and they move apart again. If a saved mode is gone (another cable, say)
   the nearest one is used and you are told.
-- Changes are **kept across reboots** by default, which also makes GNOME show
-  its usual *Keep Changes?* dialog — a safety net: a layout that leaves you
-  with a black screen reverts after 20 s. `--temporary` (or the panel's menu)
-  skips both.
+- Changes apply **quietly** — no *Keep Changes?* dialog. GNOME only remembers
+  a layout it asked about, so a small autostart entry (`gnome-monitor
+  restore`) puts the last quiet layout back when you log in, unless GNOME
+  saved a newer one of its own meanwhile. Prefer GNOME's dialog and its own
+  memory (it also survives a monitor being re-plugged)? Turn on *Ask to Keep
+  Changes* in the panel's menu or `gnome-monitor settings ask-to-keep on`;
+  `--persistent` / `--temporary` override it per call.
+- In the panel, **Edit** above the picture lets you drag the screens around
+  like in GNOME Settings — they snap to each other — and *Apply* sends the
+  arrangement to Mutter.
 
 ## Usage
 
@@ -44,11 +50,16 @@ gnome-monitor only odyssey hp      # exactly these on, every other off
 gnome-monitor main odyssey         # the main screen
 gnome-monitor mode rog 2560x1440@165
 gnome-monitor modes rog            # what it offers
-gnome-monitor-panel                # the GTK panel: switches, main-screen radio, dropdowns, profiles
+gnome-monitor settings             # ask-to-keep / restore-at-login
+gnome-monitor-panel                # the GTK panel ("Gnome Monitor" in the app grid)
 ```
 
 `--dry-run` on any change asks Mutter whether the layout is valid and
-changes nothing; `--temporary` applies without remembering.
+changes nothing.
+
+In the panel: click a profile to apply it, the switch turns a screen off and
+on, *Main* picks the main screen, the gear opens resolution / refresh rate /
+scale, *Edit* above the picture arranges the screens by dragging.
 
 ## Install
 
@@ -64,8 +75,9 @@ Manually: `./install.sh` (user-level only — `~/.local`, no root, ever). On a
 machine without GTK4 (or with `kiwi install --cli-only`) the panel is
 skipped; the CLI needs only `python3` with PyGObject, which GNOME ships.
 
-`kiwi uninstall gnome-monitor` removes the programs but keeps
-`~/.config/gnome-monitor` (your profiles); `--purge` removes that too.
+`kiwi uninstall gnome-monitor` removes the programs and the autostart entry
+but keeps `~/.config/gnome-monitor` (your profiles); `--purge` removes that
+too.
 
 ## License
 

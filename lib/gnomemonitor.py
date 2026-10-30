@@ -30,7 +30,20 @@ TRANSFORMS = ["normal", "90", "180", "270",
 CONF_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-monitor")
 PROFILES_DIR = os.path.join(CONF_DIR, "profiles")
 LAST_SEEN_FILE = os.path.join(CONF_DIR, "last-seen.json")
+LAST_APPLIED_FILE = os.path.join(CONF_DIR, "last-applied.json")
 CONF_FILE = os.path.join(CONF_DIR, "gnome-monitor.conf")
+MONITORS_XML = os.path.join(GLib.get_user_config_dir(), "monitors.xml")
+AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart",
+                              "eu.kiwinetwork.GnomeMonitor-restore.desktop")
+# keep in sync with data/gnome-monitor-restore.desktop
+AUTOSTART_DESKTOP = """[Desktop Entry]
+Type=Application
+Name=Gnome Monitor (restore layout)
+Comment=Re-applies the last display layout at login
+Exec={exe} restore --delay 3
+NoDisplay=true
+OnlyShowIn=GNOME;
+"""
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 MODE_RE = re.compile(r"^(\d+)x(\d+)(?:@([\d.]+))?(\+vrr)?$")
@@ -489,9 +502,12 @@ class Layout:
         return GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
                             (self.state.serial, method, lms, props))
 
-    def apply(self, method=PERSISTENT):
-        """VERIFY only checks; TEMPORARY applies until the next change or
-        login; PERSISTENT applies and GNOME asks to keep the changes."""
+    def apply(self, method=None):
+        """VERIFY only checks; TEMPORARY applies quietly, and 'restore' puts
+        it back at the next login; PERSISTENT makes GNOME ask to keep the
+        changes and remember them itself. None = what the user configured."""
+        if method is None:
+            method = default_method()
         if not self.logicals:
             raise MonitorError("refusing to turn every screen off")
         try:
@@ -499,6 +515,9 @@ class Layout:
                                Gio.DBusCallFlags.NO_AUTO_START, -1, None)
         except GLib.Error as e:
             raise MonitorError(clean_error(e)) from e
+        # a persistent one is Mutter's to remember — if the user keeps it
+        if method == TEMPORARY:
+            save_last_applied(self)
 
     # ── profiles / comparison ──────────────────────────────────────────────
     def to_profile(self):
@@ -535,6 +554,14 @@ class Layout:
 
     def same_as(self, other):
         return self.signature() == other.signature()
+
+    def compact(self):
+        """'HP X27q · Odyssey G70NC ★ · ROG PG279Q off'"""
+        parts = [m.name + (" ★" if l.primary else "")
+                 for l in self.ordered_logicals() for m in l.monitors]
+        on = {m for l in self.logicals for m in l.monitors}
+        parts += [f"{m.name} off" for m in self.state.monitors if m not in on]
+        return " · ".join(parts)
 
     def summary(self):
         """One line: 'Odyssey G70NC 3840×2160 @ 144 Hz VRR (main) · HP X27q … · ROG PG279Q off'"""
@@ -698,6 +725,75 @@ def remember(layout):
         os.replace(tmp, LAST_SEEN_FILE)
 
 
+def save_last_applied(layout):
+    data = layout.to_profile()
+    data["applied"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = LAST_APPLIED_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, LAST_APPLIED_FILE)
+
+
+def load_last_applied():
+    try:
+        with open(LAST_APPLIED_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def mutter_saved_later():
+    """True when GNOME wrote its own monitors.xml after our last quiet apply —
+    then it remembers a newer layout and 'restore' must not override it."""
+    try:
+        return os.path.getmtime(MONITORS_XML) > os.path.getmtime(LAST_APPLIED_FILE)
+    except OSError:
+        return False
+
+
+def cli_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in (os.path.join(here, "..", "..", "bin", "gnome-monitor"),   # <prefix>/share/gnome-monitor
+              os.path.join(here, "..", "bin", "gnome-monitor")):        # the repo's lib/
+        if os.path.exists(c):
+            return os.path.normpath(c)
+    return "gnome-monitor"
+
+
+# ── settings ──────────────────────────────────────────────────────────────────
+
+def ask_to_keep():
+    """Apply persistently, so GNOME shows its 'Keep Changes?' dialog and
+    remembers the layout itself. Off: apply quietly, restore at login."""
+    return conf_get("PERSISTENT", "0") == "1"
+
+
+def set_ask_to_keep(on):
+    conf_set("PERSISTENT", "1" if on else "0")
+
+
+def default_method():
+    return PERSISTENT if ask_to_keep() else TEMPORARY
+
+
+def restore_at_login():
+    return conf_get("RESTORE_AT_LOGIN", "1") == "1"
+
+
+def set_restore_at_login(on):
+    conf_set("RESTORE_AT_LOGIN", "1" if on else "0")
+    if on:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w") as fh:
+            fh.write(AUTOSTART_DESKTOP.format(exe=cli_path()))
+    else:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except FileNotFoundError:
+            pass
+
+
 def conf_get(key, default):
     try:
         with open(CONF_FILE) as fh:
@@ -725,6 +821,52 @@ def conf_set(key, value):
         lines.append(f"{key}={value}\n")
     with open(CONF_FILE, "w") as fh:
         fh.writelines(lines)
+
+
+# ── arranging ─────────────────────────────────────────────────────────────────
+
+def snap(layout, lg, x, y, tol=0):
+    """Where a dragged screen lands when let go at (x, y): there, if it
+    touches another screen and covers none — else docked to the nearest side
+    of the nearest screen. Edges and centres within tol snap into line."""
+    lm = layout.layout_mode
+    others = [o.rect(lm) for o in layout.logicals if o is not lg]
+    if not others:
+        return x, y
+    w, h = lg.size(lm)
+
+    def fits(r):
+        return (not any(r.overlaps(o) for o in others)
+                and any(r.adjacent(o) for o in others))
+
+    cands = []
+    for o in others:
+        # along a side, keep the dragged position but stay in touch
+        cy = min(max(y, o.y - h + 1), o.bottom - 1)
+        cx = min(max(x, o.x - w + 1), o.right - 1)
+        for px, py, side in ((o.right, cy, "x"), (o.x - w, cy, "x"),
+                             (cx, o.bottom, "y"), (cx, o.y - h, "y")):
+            if tol and side == "x":
+                for ay in (o.y, o.bottom - h, o.cy - h // 2):
+                    if abs(py - ay) <= tol:
+                        py = ay
+                        break
+            elif tol:
+                for ax in (o.x, o.right - w, o.x + o.w // 2 - w // 2):
+                    if abs(px - ax) <= tol:
+                        px = ax
+                        break
+            cands.append((px, py))
+
+    def dist(c):
+        return (c[0] - x) ** 2 + (c[1] - y) ** 2
+
+    if fits(Rect(x, y, w, h)):
+        near = [c for c in cands if abs(c[0] - x) <= tol and abs(c[1] - y) <= tol
+                and fits(Rect(c[0], c[1], w, h))]
+        return min(near, key=dist) if near else (x, y)
+    good = [c for c in cands if fits(Rect(c[0], c[1], w, h))]
+    return min(good, key=dist) if good else (x, y)
 
 
 # ── text output ───────────────────────────────────────────────────────────────

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Gnome Monitor (restore layout)
+Comment=Re-applies the last display layout at login
+Exec=gnome-monitor restore --delay 3
+NoDisplay=true
+OnlyShowIn=GNOME;

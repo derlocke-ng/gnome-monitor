@@ -10,15 +10,20 @@
   gnome-monitor only <monitor>...    exactly these screens on, every other off
   gnome-monitor main <monitor>       make it the main screen
   gnome-monitor mode <monitor> <WxH[@Hz][+vrr]>   resolution / refresh rate
+  gnome-monitor modes <monitor>      what a screen offers
   gnome-monitor delete <name>
+  gnome-monitor restore              re-apply the last layout (runs at login)
+  gnome-monitor settings [ask-to-keep on|off] [restore-at-login on|off]
 
 A <monitor> is a connector (DP-3), a part of its name (odyssey), its number in
-'show', or 'main'. Changes are kept across reboots and GNOME asks to confirm
-them; --temporary skips both, --dry-run only checks.
+'show', or 'main'. Changes apply quietly and 'restore' puts them back at the
+next login; with 'ask-to-keep on' (or --persistent) GNOME shows its
+"Keep Changes?" dialog and remembers the layout itself. --dry-run only checks.
 """
 import argparse
 import os
 import sys
+import time
 
 _here = os.path.dirname(os.path.realpath(__file__))
 for _d in (os.path.join(_here, "..", "share", "gnome-monitor"), os.path.join(_here, "..", "lib")):
@@ -47,13 +52,21 @@ def commit(lay, args, notes):
         say(f"  {n}")
     if args.dry_run:
         lay.apply(gm.VERIFY)
-        say("ok — Mutter accepts this layout (nothing applied):", *(("    " + s) for s in gm.describe(lay, numbered=False)))
+        say("ok — Mutter accepts this layout (nothing applied):",
+            *(("    " + s) for s in gm.describe(lay, numbered=False)))
         return
-    method = gm.TEMPORARY if args.temporary else gm.PERSISTENT
+    if args.persistent:
+        method = gm.PERSISTENT
+    elif args.temporary:
+        method = gm.TEMPORARY
+    else:
+        method = gm.default_method()
     lay.apply(method)
     say(*gm.describe(lay))
     if method == gm.PERSISTENT:
         say("applied — GNOME asks you to keep the changes (it reverts in 20 s otherwise)")
+    elif gm.restore_at_login():
+        say("applied — put back at the next login")
     else:
         say("applied until the next change or login")
 
@@ -165,6 +178,50 @@ def cmd_delete(args):
     say(f"deleted profile '{args.name}'")
 
 
+def cmd_restore(args):
+    """Quiet applies are not remembered by GNOME; at login this puts the
+    last one back — unless GNOME saved a newer layout of its own."""
+    data = gm.load_last_applied()
+    if not data:
+        say("nothing to restore yet")
+        return
+    if gm.mutter_saved_later():
+        say("GNOME remembers a newer layout itself — nothing to do")
+        return
+    if args.delay:
+        time.sleep(args.delay)
+    cur = current()
+    lay, notes = gm.layout_from_profile(data, cur.state)
+    if not lay.logicals:
+        say("none of the last layout's screens is connected")
+        return
+    if lay.same_as(cur):
+        say("the last layout is already in place")
+        return
+    if args.dry_run:
+        lay.apply(gm.VERIFY)
+        say("would restore: " + lay.summary())
+        return
+    lay.apply(gm.TEMPORARY)
+    say(*(f"  {n}" for n in notes), "restored: " + lay.summary())
+
+
+def cmd_settings(args):
+    changed = False
+    if args.ask_to_keep:
+        gm.set_ask_to_keep(args.ask_to_keep == "on")
+        changed = True
+    if args.restore_at_login:
+        gm.set_restore_at_login(args.restore_at_login == "on")
+        changed = True
+    say(f"ask-to-keep      {'on' if gm.ask_to_keep() else 'off'}   "
+        "— GNOME's \"Keep Changes?\" dialog; it remembers the layout itself",
+        f"restore-at-login {'on' if gm.restore_at_login() else 'off'}   "
+        "— re-apply the last quiet layout when you log in")
+    if not changed:
+        say("", "change with: gnome-monitor settings ask-to-keep on|off  restore-at-login on|off")
+
+
 def main(argv):
     p = argparse.ArgumentParser(prog="gnome-monitor", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -173,8 +230,11 @@ def main(argv):
 
     def applying(name, help_, **kw):
         sp = sub.add_parser(name, help=help_, **kw)
-        sp.add_argument("-t", "--temporary", action="store_true",
-                        help="do not keep across reboots (and skip GNOME's confirmation)")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("-t", "--temporary", action="store_true",
+                       help="apply quietly, whatever the settings say")
+        g.add_argument("-p", "--persistent", action="store_true",
+                       help="let GNOME ask to keep the changes and remember them")
         sp.add_argument("-n", "--dry-run", action="store_true",
                         help="only ask Mutter whether the layout is valid")
         return sp
@@ -209,8 +269,28 @@ def main(argv):
     sp = sub.add_parser("delete", help="delete a profile")
     sp.add_argument("name")
     sp.set_defaults(fn=cmd_delete)
+    sp = sub.add_parser("restore", help="re-apply the last layout (at login)")
+    sp.add_argument("--delay", type=float, default=0, metavar="SECONDS",
+                    help="wait first — the session is still settling at login")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="only say what would happen")
+    sp.set_defaults(fn=cmd_restore)
+    sp = sub.add_parser("settings", help="show or change the settings")
+    sp.add_argument("--ask-to-keep", choices=("on", "off"), dest="ask_to_keep")
+    sp.add_argument("--restore-at-login", choices=("on", "off"), dest="restore_at_login")
+    sp.add_argument("pairs", nargs="*", metavar="KEY on|off", help=argparse.SUPPRESS)
+    sp.set_defaults(fn=cmd_settings)
 
     args = p.parse_args(argv)
+    if args.cmd == "settings" and args.pairs:
+        # 'settings ask-to-keep off restore-at-login on' without dashes
+        pairs = args.pairs
+        if len(pairs) % 2:
+            p.error("settings takes KEY on|off pairs")
+        for key, val in zip(pairs[::2], pairs[1::2]):
+            key = key.replace("_", "-")
+            if key not in ("ask-to-keep", "restore-at-login") or val not in ("on", "off"):
+                p.error(f"unknown setting '{key} {val}'")
+            setattr(args, key.replace("-", "_"), val)
     try:
         args.fn(args)
     except gm.MonitorError as e:

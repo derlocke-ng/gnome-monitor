@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Monitor Profiles
+Name=Gnome Monitor
 Comment=Save and switch display layouts; turn monitors off and on
 Exec=gnome-monitor-panel
 Icon=eu.kiwinetwork.GnomeMonitor
