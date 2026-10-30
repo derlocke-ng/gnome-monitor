@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor Profiles
+Comment=Save and switch display layouts; turn monitors off and on
+Exec=gnome-monitor-panel
+Icon=eu.kiwinetwork.GnomeMonitor
+Terminal=false
+Categories=Settings;HardwareSettings;System;
+Keywords=monitor;display;screen;layout;profile;resolution;refresh;

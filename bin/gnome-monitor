@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""gnome-monitor — save and switch display layouts on GNOME (Wayland and X11).
+
+  gnome-monitor show                 what is connected, on, where, and at what mode
+  gnome-monitor save <name>          save the current layout as a profile
+  gnome-monitor list                 profiles (* = matches the current layout)
+  gnome-monitor apply <name>         switch to a profile
+  gnome-monitor off <monitor>...     turn screens off (the rest closes the gap)
+  gnome-monitor on <monitor>...      turn screens on, where and how they last were
+  gnome-monitor only <monitor>...    exactly these screens on, every other off
+  gnome-monitor main <monitor>       make it the main screen
+  gnome-monitor mode <monitor> <WxH[@Hz][+vrr]>   resolution / refresh rate
+  gnome-monitor delete <name>
+
+A <monitor> is a connector (DP-3), a part of its name (odyssey), its number in
+'show', or 'main'. Changes are kept across reboots and GNOME asks to confirm
+them; --temporary skips both, --dry-run only checks.
+"""
+import argparse
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _d in (os.path.join(_here, "..", "share", "gnome-monitor"), os.path.join(_here, "..", "lib")):
+    if os.path.exists(os.path.join(_d, "gnomemonitor.py")):
+        sys.path.insert(0, os.path.normpath(_d))
+        break
+import gnomemonitor as gm  # noqa: E402
+
+
+def say(*lines):
+    for line in lines:
+        print(line)
+
+
+def current():
+    state = gm.get_state()
+    lay = gm.Layout(state)
+    gm.remember(lay)
+    return lay
+
+
+def commit(lay, args, notes):
+    """normalize, then verify / apply, and tell what happened."""
+    notes = list(notes) + lay.normalize()
+    for n in notes:
+        say(f"  {n}")
+    if args.dry_run:
+        lay.apply(gm.VERIFY)
+        say("ok — Mutter accepts this layout (nothing applied):", *(("    " + s) for s in gm.describe(lay, numbered=False)))
+        return
+    method = gm.TEMPORARY if args.temporary else gm.PERSISTENT
+    lay.apply(method)
+    say(*gm.describe(lay))
+    if method == gm.PERSISTENT:
+        say("applied — GNOME asks you to keep the changes (it reverts in 20 s otherwise)")
+    else:
+        say("applied until the next change or login")
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_show(args):
+    lay = current()
+    mode = "physical" if lay.layout_mode == gm.PHYSICAL else "logical"
+    n_on = sum(len(l.monitors) for l in lay.logicals)
+    say(f"{len(lay.state.monitors)} monitor(s) connected, {n_on} on, {mode} layout", "")
+    say(*gm.describe(lay), "")
+    say(*gm.ascii_map(lay), "")
+    active = gm.active_profiles(lay)
+    say("profile: " + (", ".join(active) if active else "(none matches — save one with: gnome-monitor save <name>)"))
+
+
+def cmd_save(args):
+    lay = current()
+    gm.save_profile(args.name, lay)
+    say(f"saved profile '{args.name}': {lay.summary()}", f"  {gm.profile_path(args.name)}")
+
+
+def cmd_list(args):
+    lay = current()
+    names = gm.list_profiles()
+    if not names:
+        say("no profiles yet — save the current layout with: gnome-monitor save <name>")
+        return
+    active = set(gm.active_profiles(lay))
+    for name in names:
+        try:
+            other, notes = gm.layout_from_profile(gm.load_profile(name), lay.state)
+            text = other.summary() or "(no connected screen is in it)"
+        except gm.MonitorError as e:
+            text = f"broken: {e}"
+        say(f"{'*' if name in active else ' '} {name:<20} {text}")
+
+
+def cmd_apply(args):
+    lay = current()
+    new, notes = gm.layout_from_profile(gm.load_profile(args.name), lay.state)
+    if not new.logicals:
+        raise gm.MonitorError(f"none of the screens in '{args.name}' is connected")
+    commit(new, args, notes)
+
+
+def cmd_off(args):
+    lay = current()
+    # resolve every name first: numbers refer to the order before any change
+    targets = [lay.find(q) for q in args.monitor]
+    notes = []
+    for m in targets:
+        notes += lay.off(m)
+    commit(lay, args, notes)
+
+
+def cmd_on(args):
+    lay = current()
+    targets = [lay.find(q) for q in args.monitor]
+    notes = []
+    for m in targets:
+        notes += lay.on(m)
+    commit(lay, args, notes)
+
+
+def cmd_only(args):
+    lay = current()
+    keep = [lay.find(q) for q in args.monitor]
+    notes = []
+    for m in lay.monitors():
+        if m not in keep:
+            notes += lay.off(m)
+    for m in keep:
+        notes += lay.on(m)
+    commit(lay, args, notes)
+
+
+def cmd_main(args):
+    lay = current()
+    commit(lay, args, lay.set_main(lay.find(args.monitor)))
+
+
+def cmd_mode(args):
+    lay = current()
+    m = lay.find(args.monitor)
+    mt = gm.MODE_RE.match(args.mode.lower())
+    if not mt:
+        raise gm.MonitorError("a mode looks like 3840x2160, 3840x2160@144 or 3840x2160@144+vrr")
+    w, h, rate, vrr = mt.groups()
+    mode = m.find_mode(int(w), int(h), float(rate) if rate else None, bool(vrr) if vrr else None)
+    if not mode:
+        res = ", ".join(f"{a}x{b}" for a, b in m.resolutions())
+        raise gm.MonitorError(f"{m.name} has no {w}x{h} — it offers: {res}")
+    commit(lay, args, lay.set_mode(m, mode))
+
+
+def cmd_modes(args):
+    lay = current()
+    m = lay.find(args.monitor)
+    say(f"{m.name} ({m.connector}):")
+    for w, h in m.resolutions():
+        rates = ", ".join(mo.hz + ("*" if mo.is_current else "") for mo in m.modes_for(w, h))
+        say(f"  {w}x{h}: {rates}")
+
+
+def cmd_delete(args):
+    gm.delete_profile(args.name)
+    say(f"deleted profile '{args.name}'")
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="gnome-monitor", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    def applying(name, help_, **kw):
+        sp = sub.add_parser(name, help=help_, **kw)
+        sp.add_argument("-t", "--temporary", action="store_true",
+                        help="do not keep across reboots (and skip GNOME's confirmation)")
+        sp.add_argument("-n", "--dry-run", action="store_true",
+                        help="only ask Mutter whether the layout is valid")
+        return sp
+
+    sub.add_parser("show", help="the current layout").set_defaults(fn=cmd_show)
+    sp = sub.add_parser("save", help="save the current layout as a profile")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_save)
+    sub.add_parser("list", help="saved profiles").set_defaults(fn=cmd_list)
+    sp = applying("apply", "switch to a profile")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_apply)
+    sp = applying("off", "turn screens off")
+    sp.add_argument("monitor", nargs="+")
+    sp.set_defaults(fn=cmd_off)
+    sp = applying("on", "turn screens on")
+    sp.add_argument("monitor", nargs="+")
+    sp.set_defaults(fn=cmd_on)
+    sp = applying("only", "exactly these screens on")
+    sp.add_argument("monitor", nargs="+")
+    sp.set_defaults(fn=cmd_only)
+    sp = applying("main", "make a screen the main one")
+    sp.add_argument("monitor")
+    sp.set_defaults(fn=cmd_main)
+    sp = applying("mode", "set resolution and refresh rate")
+    sp.add_argument("monitor")
+    sp.add_argument("mode", help="WxH, WxH@Hz or WxH@Hz+vrr")
+    sp.set_defaults(fn=cmd_mode)
+    sp = sub.add_parser("modes", help="what a screen offers")
+    sp.add_argument("monitor")
+    sp.set_defaults(fn=cmd_modes)
+    sp = sub.add_parser("delete", help="delete a profile")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_delete)
+
+    args = p.parse_args(argv)
+    try:
+        args.fn(args)
+    except gm.MonitorError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

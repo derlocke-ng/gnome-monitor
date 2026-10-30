@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""gnome-monitor-panel — GTK4/libadwaita panel for gnome-monitor (GNOME 40+).
+
+A picture of the layout, one row per connected screen (on/off, main,
+resolution, refresh rate, scale) and the saved profiles. Every change goes
+straight to Mutter, the same way GNOME Settings does it.
+"""
+import os
+import signal
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango, PangoCairo  # noqa: E402
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _d in (os.path.join(_here, "..", "share", "gnome-monitor"), os.path.join(_here, "..", "lib")):
+    if os.path.exists(os.path.join(_d, "gnomemonitor.py")):
+        sys.path.insert(0, os.path.normpath(_d))
+        break
+import gnomemonitor as gm  # noqa: E402
+
+APP_ID = "eu.kiwinetwork.GnomeMonitor"
+
+
+# ── main window ──────────────────────────────────────────────────────────────
+
+class MonitorWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Monitor Profiles")
+        self.set_default_size(640, 800)
+        self._busy = False
+        self._updating = False      # filling widgets, not the user
+        self._lay = None
+        self._rows: dict = {}       # monitor.key -> widgets
+        self._profile_rows: list = []
+        self._refresh_pending = None
+        self.persistent = gm.conf_get("PERSISTENT", "1") == "1"
+        self._actions()
+        self._build()
+        self._refresh()
+        # Mutter says when the layout changes — GNOME Settings, a cable, or us
+        try:
+            self._proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+                gm.BUS_NAME, gm.OBJECT_PATH, gm.INTERFACE, None)
+            self._proxy.connect("g-signal", self._on_dbus_signal)
+        except GLib.Error:
+            self._proxy = None
+
+    # ── actions / menu ─────────────────────────────────────────────────────
+    def _actions(self):
+        a = Gio.SimpleAction.new_stateful("persistent", None, GLib.Variant.new_boolean(self.persistent))
+        a.connect("change-state", self._on_persistent)
+        self.add_action(a)
+        a = Gio.SimpleAction.new("open-folder", None)
+        a.connect("activate", self._open_folder)
+        self.add_action(a)
+
+    def _on_persistent(self, action, value):
+        action.set_state(value)
+        self.persistent = value.get_boolean()
+        gm.conf_set("PERSISTENT", "1" if self.persistent else "0")
+        self._set_status("Changes are kept across reboots — GNOME asks to confirm each one."
+                         if self.persistent else
+                         "Changes last until the next change or login — no confirmation.")
+
+    def _open_folder(self, *_):
+        os.makedirs(gm.PROFILES_DIR, exist_ok=True)
+        Gio.AppInfo.launch_default_for_uri(f"file://{gm.PROFILES_DIR}", None)
+
+    # ── layout ─────────────────────────────────────────────────────────────
+    def _build(self):
+        root = Adw.ToolbarView()
+        self.set_content(root)
+
+        hdr = Adw.HeaderBar()
+        hdr.set_title_widget(Adw.WindowTitle(title="Monitor Profiles", subtitle="display layouts"))
+        btn_refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+        btn_refresh.connect("clicked", lambda *_: self._refresh())
+        hdr.pack_start(btn_refresh)
+        menu = Gio.Menu()
+        menu.append("Keep Changes Across Reboots", "win.persistent")
+        menu.append("Open Profiles Folder", "win.open-folder")
+        hdr.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                    tooltip_text="Menu"))
+        root.add_top_bar(hdr)
+
+        self._toasts = Adw.ToastOverlay()
+        root.set_content(self._toasts)
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._toasts.set_child(scroll)
+        page = Adw.PreferencesPage()
+        scroll.set_child(page)
+
+        # ── the picture ──────────────────────────────────────────────────
+        map_grp = Adw.PreferencesGroup(title="Layout")
+        page.add(map_grp)
+        self._map = Gtk.DrawingArea(content_height=190, hexpand=True)
+        self._map.set_draw_func(self._draw_map)
+        card = Adw.Bin(child=self._map)
+        card.add_css_class("card")
+        map_grp.add(card)
+
+        # ── monitors ─────────────────────────────────────────────────────
+        self._mon_grp = Adw.PreferencesGroup(
+            title="Monitors", description="Switch a screen off while another computer uses it; "
+                                          "it comes back where it was.")
+        page.add(self._mon_grp)
+
+        # ── profiles ─────────────────────────────────────────────────────
+        self._prof_grp = Adw.PreferencesGroup(title="Profiles")
+        box = Gtk.Box(spacing=6)
+        self._name_entry = Gtk.Entry(placeholder_text="profile name", width_chars=14,
+                                     valign=Gtk.Align.CENTER)
+        self._name_entry.connect("activate", lambda *_: self._save_profile())
+        save_btn = Gtk.Button(label="Save Current", valign=Gtk.Align.CENTER)
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", lambda *_: self._save_profile())
+        box.append(self._name_entry)
+        box.append(save_btn)
+        self._prof_grp.set_header_suffix(box)
+        page.add(self._prof_grp)
+        self._prof_empty = Adw.ActionRow(
+            title="No profiles yet",
+            subtitle="Save the current layout under a name, switch back to it any time.",
+            selectable=False)
+
+        # ── status bar ───────────────────────────────────────────────────
+        self._status_lbl = Gtk.Label(label="", xalign=0, margin_start=16, margin_end=16,
+                                     margin_top=4, margin_bottom=4, ellipsize=Pango.EllipsizeMode.END)
+        self._status_lbl.add_css_class("caption")
+        self._status_lbl.add_css_class("dim-label")
+        root.add_bottom_bar(self._status_lbl)
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _set_status(self, text):
+        self._status_lbl.set_label(text)
+        self._status_lbl.set_tooltip_text(text)
+
+    def _toast(self, text, timeout=4):
+        self._toasts.add_toast(Adw.Toast(title=text, timeout=timeout))
+        self._set_status(text)
+
+    def _on_dbus_signal(self, _proxy, _sender, signal, _params):
+        if signal == "MonitorsChanged":
+            if self._refresh_pending:
+                GLib.source_remove(self._refresh_pending)
+            self._refresh_pending = GLib.timeout_add(400, self._refresh_later)
+
+    def _refresh_later(self):
+        self._refresh_pending = None
+        self._refresh()
+        return GLib.SOURCE_REMOVE
+
+    # ── refresh ────────────────────────────────────────────────────────────
+    def _refresh(self):
+        try:
+            self._lay = gm.Layout(gm.get_state())
+            gm.remember(self._lay)
+        except gm.MonitorError as e:
+            self._set_status(str(e))
+            return
+        self._updating = True
+        try:
+            self._populate_monitors()
+            self._populate_profiles()
+        finally:
+            self._updating = False
+        self._map.queue_draw()
+        lay = self._lay
+        n_on = sum(len(l.monitors) for l in lay.logicals)
+        active = gm.active_profiles(lay)
+        self._set_status(f"{len(lay.state.monitors)} connected · {n_on} on"
+                         + (f" · profile: {', '.join(active)}" if active else ""))
+
+    def _populate_monitors(self):
+        lay = self._lay
+        mons = lay.monitors()
+        keys = [m.key for m in mons]
+        if keys != list(self._rows):
+            for rd in self._rows.values():
+                self._mon_grp.remove(rd["row"])
+            self._rows = {}
+            first_check = None
+            for m in mons:
+                rd = self._make_monitor_row(m, first_check)
+                first_check = first_check or rd["main"]
+                self._mon_grp.add(rd["row"])
+                self._rows[m.key] = rd
+        for m in mons:
+            self._update_monitor_row(m)
+
+    def _make_monitor_row(self, m, group_check):
+        row = Adw.ExpanderRow(title=m.name, icon_name="video-display-symbolic")
+
+        main = Gtk.CheckButton(label="Main", valign=Gtk.Align.CENTER, tooltip_text="Main screen")
+        if group_check:
+            main.set_group(group_check)
+        main.connect("toggled", self._on_main, m.key)
+        row.add_suffix(main)
+
+        switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="On / off")
+        switch.connect("notify::active", self._on_switch, m.key)
+        row.add_suffix(switch)
+
+        res = Adw.ComboRow(title="Resolution")
+        res.connect("notify::selected", self._on_resolution, m.key)
+        row.add_row(res)
+        rate = Adw.ComboRow(title="Refresh rate")
+        rate.connect("notify::selected", self._on_rate, m.key)
+        row.add_row(rate)
+        scale = Adw.ComboRow(title="Scale")
+        scale.connect("notify::selected", self._on_scale, m.key)
+        row.add_row(scale)
+        info = Adw.ActionRow(title=m.display_name or m.connector,
+                             subtitle=f"{m.connector} · {m.vendor} {m.product} · {m.serial}",
+                             selectable=False)
+        info.add_css_class("property")
+        row.add_row(info)
+        return {"row": row, "main": main, "switch": switch, "res": res, "rate": rate,
+                "scale": scale, "mode": None}
+
+    def _shown_mode(self, m):
+        """What the combos show: the live mode, else what it last ran at."""
+        if m.mode:
+            return m.mode
+        seen = gm.load_last_seen().get(m.key, {})
+        return m.find_mode_id(seen.get("mode")) or m.preferred_mode or (m.modes[0] if m.modes else None)
+
+    def _update_monitor_row(self, m):
+        rd = self._rows[m.key]
+        lay = self._lay
+        l = lay.logical_of(m)
+        rd["switch"].set_active(l is not None)
+        rd["main"].set_sensitive(l is not None)
+        rd["main"].set_active(bool(l and l.primary))
+        if l:
+            r = l.rect(lay.layout_mode)
+            extra = ""
+            if abs(l.scale - 1) > 1e-3:
+                extra += f" · {l.scale * 100:.0f} %"
+            if l.transform:
+                extra += f" · {gm.TRANSFORMS[l.transform]}"
+            rd["row"].set_subtitle(f"{m.connector} · {m.mode} · at {r.x},{r.y}{extra}")
+        else:
+            rd["row"].set_subtitle(f"{m.connector} · off")
+
+        mode = self._shown_mode(m)
+        rd["mode"] = mode
+        if not mode:
+            return
+        rlist = m.resolutions()
+        rd["res"].set_model(Gtk.StringList.new([f"{w}×{h}" for w, h in rlist]))
+        rd["res"].set_selected(rlist.index((mode.width, mode.height)))
+        modes = m.modes_for(mode.width, mode.height)
+        rd["rate"].set_model(Gtk.StringList.new([mo.hz for mo in modes]))
+        rd["rate"].set_selected(modes.index(mode))
+        scales = list(mode.scales)
+        rd["scale"].set_model(Gtk.StringList.new([f"{s * 100:.0f} %" for s in scales]))
+        cur = l.scale if l else mode.preferred_scale
+        idx = min(range(len(scales)), key=lambda i: abs(scales[i] - cur)) if scales else 0
+        rd["scale"].set_selected(idx)
+
+    def _populate_profiles(self):
+        for r in self._profile_rows:
+            self._prof_grp.remove(r)
+        self._profile_rows = []
+        names = gm.list_profiles()
+        active = set(gm.active_profiles(self._lay))
+        if not names:
+            self._prof_grp.add(self._prof_empty)
+            self._profile_rows.append(self._prof_empty)
+            return
+        for name in names:
+            try:
+                other, _ = gm.layout_from_profile(gm.load_profile(name), self._lay.state)
+                text = other.summary() or "none of its screens is connected"
+            except gm.MonitorError as e:
+                text = f"broken: {e}"
+            row = Adw.ActionRow(title=name, subtitle=text, selectable=False)
+            if name in active:
+                icon = Gtk.Image(icon_name="emblem-ok-symbolic")
+                icon.add_css_class("success")
+                row.add_prefix(icon)
+            apply_btn = Gtk.Button(label="Apply", valign=Gtk.Align.CENTER)
+            apply_btn.add_css_class("suggested-action")
+            apply_btn.connect("clicked", lambda _b, n=name: self._apply_profile(n))
+            row.add_suffix(apply_btn)
+            del_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                 tooltip_text="Delete profile")
+            del_btn.add_css_class("flat")
+            del_btn.connect("clicked", lambda _b, n=name: self._delete_profile(n))
+            row.add_suffix(del_btn)
+            self._prof_grp.add(row)
+            self._profile_rows.append(row)
+
+    # ── the picture ────────────────────────────────────────────────────────
+    def _draw_map(self, area, cr, width, height):
+        fg = area.get_color()
+        lay = self._lay
+        if not lay or not lay.logicals:
+            self._text(cr, "every screen is off", width / 2, height / 2, fg, "Cantarell 11", width)
+            return
+        lm = lay.layout_mode
+        items = [(l, l.rect(lm)) for l in lay.ordered_logicals()]
+        max_x = max(r.right for _, r in items)
+        max_y = max(r.bottom for _, r in items)
+        pad = 14
+        s = min((width - 2 * pad) / max_x, (height - 2 * pad) / max_y)
+        ox = (width - max_x * s) / 2
+        oy = (height - max_y * s) / 2
+        sm = Adw.StyleManager.get_default()
+        accent = (sm.get_accent_color_rgba() if hasattr(sm, "get_accent_color_rgba")
+                  else Gdk.RGBA(red=0.21, green=0.52, blue=0.89, alpha=1))
+        for l, r in items:
+            x, y, w, h = ox + r.x * s + 2, oy + r.y * s + 2, r.w * s - 4, r.h * s - 4
+            self._rounded(cr, x, y, w, h, 8)
+            col = accent if l.primary else fg
+            cr.set_source_rgba(col.red, col.green, col.blue, 0.22 if l.primary else 0.08)
+            cr.fill_preserve()
+            cr.set_source_rgba(col.red, col.green, col.blue, 1 if l.primary else 0.45)
+            cr.set_line_width(2 if l.primary else 1)
+            cr.stroke()
+            cx, cy = x + w / 2, y + h / 2
+            name = l.label + ("  ★" if l.primary else "")
+            self._text(cr, name, cx, cy - 16, fg, "Cantarell Bold 11", w - 12)
+            self._text(cr, str(l.monitors[0].mode), cx, cy + 2, fg, "Cantarell 9", w - 12)
+            self._text(cr, ", ".join(m.connector for m in l.monitors), cx, cy + 18, fg,
+                       "Cantarell 9", w - 12, alpha=0.6)
+
+    @staticmethod
+    def _rounded(cr, x, y, w, h, r):
+        r = min(r, w / 2, h / 2)
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.5708, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+        cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+        cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+        cr.close_path()
+
+    @staticmethod
+    def _text(cr, text, cx, cy, col, font, max_w, alpha=1.0):
+        layout = PangoCairo.create_layout(cr)
+        layout.set_text(text, -1)
+        layout.set_font_description(Pango.FontDescription(font))
+        layout.set_width(int(max(max_w, 10) * Pango.SCALE))
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        _ink, log = layout.get_pixel_extents()
+        cr.set_source_rgba(col.red, col.green, col.blue, alpha)
+        cr.move_to(cx - max(max_w, 10) / 2, cy - log.height / 2)
+        PangoCairo.show_layout(cr, layout)
+
+    # ── changes ────────────────────────────────────────────────────────────
+    def _monitor(self, key):
+        return next((m for m in self._lay.state.monitors if m.key == key), None)
+
+    def _on_switch(self, switch, _pspec, key):
+        if self._updating or self._busy:
+            return
+        m = self._monitor(key)
+        lay = self._lay
+        try:
+            notes = lay.on(m) if switch.get_active() else lay.off(m)
+        except gm.MonitorError as e:
+            self._toast(str(e))
+            self._refresh()
+            return
+        self._commit(lay, notes)
+
+    def _on_main(self, check, key):
+        if self._updating or self._busy or not check.get_active():
+            return
+        m = self._monitor(key)
+        lay = self._lay
+        if lay.logical_of(m) and lay.logical_of(m).primary:
+            return
+        try:
+            notes = lay.set_main(m)
+        except gm.MonitorError as e:
+            self._toast(str(e))
+            return
+        self._commit(lay, notes)
+
+    def _on_resolution(self, combo, _pspec, key):
+        if self._updating or self._busy:
+            return
+        m = self._monitor(key)
+        rd = self._rows[key]
+        w, h = m.resolutions()[combo.get_selected()]
+        old = rd["mode"]
+        mode = m.find_mode(w, h, old.rate if old else None, old.vrr if old else None)
+        if not mode or mode is old:
+            return
+        self._commit(self._lay, self._lay.set_mode(m, mode))
+
+    def _on_rate(self, combo, _pspec, key):
+        if self._updating or self._busy:
+            return
+        m = self._monitor(key)
+        rd = self._rows[key]
+        old = rd["mode"]
+        modes = m.modes_for(old.width, old.height)
+        idx = combo.get_selected()
+        if idx >= len(modes) or modes[idx] is old:
+            return
+        self._commit(self._lay, self._lay.set_mode(m, modes[idx]))
+
+    def _on_scale(self, combo, _pspec, key):
+        if self._updating or self._busy:
+            return
+        m = self._monitor(key)
+        rd = self._rows[key]
+        scales = rd["mode"].scales if rd["mode"] else []
+        idx = combo.get_selected()
+        if idx >= len(scales) or not self._lay.logical_of(m):
+            return
+        if abs(self._lay.logical_of(m).scale - scales[idx]) < 1e-3:
+            return
+        self._commit(self._lay, self._lay.set_scale(m, scales[idx]))
+
+    def _apply_profile(self, name):
+        if self._busy:
+            return
+        try:
+            lay, notes = gm.layout_from_profile(gm.load_profile(name), self._lay.state)
+        except gm.MonitorError as e:
+            self._toast(str(e))
+            return
+        if not lay.logicals:
+            self._toast(f"None of the screens in '{name}' is connected.")
+            return
+        self._commit(lay, notes, already_normalized=True)
+
+    def _commit(self, lay, notes, already_normalized=False):
+        """normalize + apply off the main loop; the result lands in a toast."""
+        if not already_normalized:
+            notes = list(notes) + lay.normalize()
+        self._busy = True
+        method = gm.PERSISTENT if self.persistent else gm.TEMPORARY
+        self._set_status("Applying…")
+
+        def worker():
+            try:
+                lay.apply(method)
+                msg = "; ".join(notes) if notes else "Applied."
+                if method == gm.PERSISTENT:
+                    msg += " — GNOME asks you to keep the changes."
+                GLib.idle_add(self._commit_done, msg, True)
+            except gm.MonitorError as e:
+                GLib.idle_add(self._commit_done, f"Mutter refused: {e}", False)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _commit_done(self, msg, ok):
+        self._busy = False
+        self._toast(msg, timeout=6 if ok else 8)
+        self._refresh()
+        return False
+
+    # ── profiles ───────────────────────────────────────────────────────────
+    def _save_profile(self):
+        name = self._name_entry.get_text().strip()
+        if not name:
+            self._toast("Enter a profile name first.")
+            return
+        try:
+            gm.check_name(name)
+        except gm.MonitorError as e:
+            self._toast(str(e))
+            return
+        if name in gm.list_profiles():
+            dlg = Adw.AlertDialog(heading=f"Replace '{name}'?",
+                                  body="The profile is overwritten with the current layout.")
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("replace", "Replace")
+            dlg.set_response_appearance("replace", Adw.ResponseAppearance.DESTRUCTIVE)
+            dlg.set_default_response("cancel")
+            dlg.set_close_response("cancel")
+            dlg.connect("response", lambda _d, r: r == "replace" and self._do_save(name))
+            dlg.present(self)
+            return
+        self._do_save(name)
+
+    def _do_save(self, name):
+        try:
+            gm.save_profile(name, self._lay)
+        except (gm.MonitorError, OSError) as e:
+            self._toast(f"Could not save: {e}")
+            return
+        self._name_entry.set_text("")
+        self._toast(f"Saved '{name}'.")
+        self._refresh()
+
+    def _delete_profile(self, name):
+        dlg = Adw.AlertDialog(heading=f"Delete '{name}'?",
+                              body="The profile file is removed. Your screens are not changed.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", self._on_delete_response, name)
+        dlg.present(self)
+
+    def _on_delete_response(self, _dlg, response, name):
+        if response != "delete":
+            return
+        try:
+            gm.delete_profile(name)
+        except gm.MonitorError as e:
+            self._toast(str(e))
+        else:
+            self._toast(f"Deleted '{name}'.")
+        self._refresh()
+
+
+# ── application ──────────────────────────────────────────────────────────────
+
+class MonitorApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            win = MonitorWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    raise SystemExit(MonitorApp().run(None))

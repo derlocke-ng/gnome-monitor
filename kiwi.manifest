@@ -1,0 +1,23 @@
+# kiwi.manifest — see https://github.com/derlocke-ng/kiwi-updater
+NAME=gnome-monitor
+DESCRIPTION=Save and switch display layouts on GNOME — resolution, refresh rate, position and main screen per monitor; turn monitors off and on when another computer uses them
+VERSION=0.1.0
+AUTHOR=derlocke-ng
+HOMEPAGE=https://github.com/derlocke-ng/gnome-monitor
+LICENSE=GPL-3.0-or-later
+
+COMPONENTS=cli gui
+CATEGORY=System
+TAGS=monitor display screen layout profile resolution refresh-rate wayland mutter kvm
+# the app's own icon, shown by the kiwi GUI — from kiwi-icons
+# (svg/classic/kiwi-os.svg); install.sh installs the same file as the
+# desktop icon under the app id
+ICON=data/gnome-monitor.svg
+ABOUT=README.md
+
+SCOPES=user
+
+# python3 with PyGObject (gi) — part of the GNOME base image
+DEPENDS=python3
+
+INSTALLER=install.sh
