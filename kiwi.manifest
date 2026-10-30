@@ -1,7 +1,7 @@
 # kiwi.manifest — see https://github.com/derlocke-ng/kiwi-updater
 NAME=gnome-monitor
 DESCRIPTION=Save and switch display layouts on GNOME — resolution, refresh rate, position and main screen per monitor; turn monitors off and on when another computer uses them
-VERSION=0.3.1
+VERSION=0.3.2
 AUTHOR=derlocke-ng
 HOMEPAGE=https://github.com/derlocke-ng/gnome-monitor
 LICENSE=GPL-3.0-or-later

@@ -926,7 +926,7 @@ def shortcuts_all():
 # MINOR_SNAP_DISTANCE widget pixels; it never detaches (MIN_OVERLAP).
 
 SNAP_X, SNAP_Y, SNAP_BOTH = 1, 2, 3
-MINOR_SNAP_DISTANCE = 6     # widget px (GNOME: 5)
+MINOR_SNAP_DISTANCE = 10    # widget px (GNOME: 5)
 MIN_OVERLAP = 25            # logical px
 
 
@@ -937,11 +937,22 @@ def snap(layout, lg, x, y, scale):
     w, h = lg.size(lm)
     x1, y1, x2, y2 = x, y, x + w, y + h
     sd = {"snapped": 0, "x": x, "y": y, "dx": 0.0, "dy": 0.0}
+    others = [o.rect(lm) for o in layout.logicals if o is not lg]
+    # nearest screen first: GNOME takes them in list order and lets the first
+    # accepted candidate win ties, so a far screen's guard could pin an axis
+    raw = Rect(x, y, w, h)
+    others.sort(key=lambda o: (max(0, o.x - raw.right, raw.x - o.right)
+                               + max(0, o.y - raw.bottom, raw.y - o.bottom)))
+    cands = []
 
     def dist(nx, ny):
         return abs(x - nx) * scale, abs(y - ny) * scale
 
+    def taken(tx, ty):
+        return any(Rect(tx, ty, w, h).overlaps(o) for o in others)
+
     def maybe(nx, ny, snapped, major, minor_unlimited=0):
+        cands.append((nx, ny))
         dx, dy = dist(nx, ny)
         d = max(dx, dy)
         # the minor axis must be (nearly) in place — unless the candidate
@@ -980,10 +991,7 @@ def snap(layout, lg, x, y, scale):
             sd["dy"], sd["y"] = dy, ny
             sd["snapped"] |= SNAP_Y
 
-    for o in layout.logicals:
-        if o is lg:
-            continue
-        r = o.rect(lm)
+    for r in others:
         _x1, _y1, _x2, _y2, _w, _h = r.x, r.y, r.right, r.bottom, r.w, r.h
         top, bottom, left, right = _y1 - h, _y2, _x1 - w, _x2
 
@@ -1017,7 +1025,15 @@ def snap(layout, lg, x, y, scale):
         maybe(left, _y2 - MIN_OVERLAP, SNAP_BOTH, SNAP_X, -1)
         maybe(right, _y1 - h + MIN_OVERLAP, SNAP_BOTH, SNAP_X, 1)
         maybe(right, _y2 - MIN_OVERLAP, SNAP_BOTH, SNAP_X, -1)
-    return sd["x"], sd["y"]
+
+    if not taken(sd["x"], sd["y"]):
+        return sd["x"], sd["y"]
+    # GNOME's pick covers a third screen (Settings would grey out Apply):
+    # take the nearest spot, out of the same candidates, where nothing is
+    free = [c for c in set(cands) if not taken(*c)]
+    if not free:
+        return sd["x"], sd["y"]
+    return min(free, key=lambda c: (max(dist(*c)), dist(*c)))
 
 
 def overlaps_any(layout, lg, x, y):
